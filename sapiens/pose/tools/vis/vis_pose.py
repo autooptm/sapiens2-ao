@@ -7,6 +7,8 @@
 import json
 import os
 from argparse import ArgumentParser
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -71,7 +73,7 @@ def process_one_image(args, image, model):
         data_samples_list.append(data["data_samples"])
 
     inputs = torch.cat(inputs_list, dim=0)  # B x 3 x H x W
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         pred = model(inputs)  # B x 3 x H x W
         if model.cfg.val_cfg is not None and model.cfg.val_cfg.get("flip_test", False):
             pred_flipped = model(inputs.flip(-1))  # B x 3 x H x W
@@ -82,7 +84,7 @@ def process_one_image(args, image, model):
             pred = (pred + pred_flipped) / 2.0
 
     # ------------------------------------------
-    pred = pred.cpu().numpy()  ## B x K x heatmap_H x heatmap_W
+    pred = pred.float().cpu().numpy()  ## B x K x heatmap_H x heatmap_W
     keypoints = []
     keypoint_scores = []
     for i, data_samples in enumerate(data_samples_list):
@@ -141,6 +143,14 @@ def main():
     args = parser.parse_args()
 
     model = init_model(args.config, args.checkpoint, device=args.device)
+    for m in model.modules():
+        if isinstance(m, (torch.nn.Linear, torch.nn.Conv2d,
+                          torch.nn.ConvTranspose2d)):
+            m.to(torch.float16)
+    assert model.backbone.blocks[0].attn.proj.weight.dtype == torch.float16
+    model.forward = torch.compile(
+        model.forward, options={"emulate_precision_casts": True}
+    )
     os.makedirs(args.output, exist_ok=True)
 
     ## add pose metainfo to model
@@ -176,23 +186,7 @@ def main():
     image_size = None
     num_keypoints_seen = None
 
-    for image_name in tqdm(image_names, total=len(image_names)):
-        image_path = os.path.join(input_dir, image_name)
-        image = cv2.imread(image_path)
-
-        try:
-            keypoints, keypoint_scores, bboxes = process_one_image(
-                args, image, model
-            )
-        except Exception as e:
-            print(f"[vis_pose] inference failed on {image_name}: {e}")
-            continue
-
-        if image_size is None:
-            image_size = [int(image.shape[0]), int(image.shape[1])]
-        if num_keypoints_seen is None and len(keypoints) > 0:
-            num_keypoints_seen = int(np.asarray(keypoints[0]).shape[0])
-
+    def render_and_save(image, keypoints, keypoint_scores, save_path):
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         vis_image_rgb = visualize_keypoints(
             image=image_rgb,
@@ -207,8 +201,47 @@ def main():
             link_color=model.pose_metainfo["skeleton_link_colors"],
         )
         vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
-        save_path = os.path.join(args.output, image_name)
         cv2.imwrite(save_path, vis_image)
+
+    reader = ThreadPoolExecutor(max_workers=1)
+    writer = ThreadPoolExecutor(max_workers=1)
+    opt_2 = deque()
+    writes = deque()
+    next_read = 0
+
+    def opt_1():
+        nonlocal next_read
+        while len(opt_2) < 4 and next_read < len(image_names):
+            path = os.path.join(input_dir, image_names[next_read])
+            opt_2.append(reader.submit(cv2.imread, path))
+            next_read += 1
+
+    opt_1()
+    for image_name in tqdm(image_names, total=len(image_names)):
+        image = opt_2.popleft().result()
+        opt_1()
+
+        try:
+            keypoints, keypoint_scores, bboxes = process_one_image(
+                args, image, model
+            )
+        except Exception as e:
+            print(f"[vis_pose] inference failed on {image_name}: {e}")
+            continue
+
+        if image_size is None:
+            image_size = [int(image.shape[0]), int(image.shape[1])]
+        if num_keypoints_seen is None and len(keypoints) > 0:
+            num_keypoints_seen = int(np.asarray(keypoints[0]).shape[0])
+
+        save_path = os.path.join(args.output, image_name)
+        writes.append(
+            writer.submit(
+                render_and_save, image, keypoints, keypoint_scores, save_path
+            )
+        )
+        while len(writes) > 4:
+            writes.popleft().result()
 
         if not args.no_save_json:
             try:
@@ -225,6 +258,11 @@ def main():
                 })
             except Exception as e:
                 print(f"[vis_pose] json record failed on {image_name}: {e}")
+
+    for f in writes:
+        f.result()
+    reader.shutdown()
+    writer.shutdown()
 
     if not args.no_save_json:
         nn = os.path.basename(os.path.normpath(args.output))

@@ -1,0 +1,175 @@
+diff --git a/sapiens/backbones/sapiens2.py b/sapiens/backbones/sapiens2.py
+index 8661d8d..102e3bd 100644
+--- a/sapiens/backbones/sapiens2.py
++++ b/sapiens/backbones/sapiens2.py
+@@ -325,12 +325,12 @@ class GroupedQueryAttention(nn.Module):
+         N = q.shape[-2]
+         prefix = N - sin.shape[-2]  ## extra tokens
+         assert prefix >= 0
+-        q_prefix = q[:, :, :prefix, :]
+-        q = self._rope_apply(q[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
+-        q = torch.cat((q_prefix, q), dim=-2)  # [B, head, N, D//head]
+-        k_prefix = k[:, :, :prefix, :]
+-        k = self._rope_apply(k[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
+-        k = torch.cat((k_prefix, k), dim=-2)  # [B, head, N, D//head]
++        if prefix > 0:
++            pad = (prefix, sin.shape[-1])
++            sin = torch.cat((sin.new_zeros(pad), sin), dim=-2)
++            cos = torch.cat((cos.new_ones(pad), cos), dim=-2)
++        q = self._rope_apply(q, sin, cos)  # [B, head, N, D//head]
++        k = self._rope_apply(k, sin, cos)  # [B, head, N, D//head]
+         q = q.to(dtype=q_dtype)
+         k = k.to(dtype=k_dtype)
+         return q, k
+@@ -364,18 +364,13 @@ class GroupedQueryAttention(nn.Module):
+             q = self.q_norm(q)
+             k = self.k_norm(k)
+ 
+-        # Repeat KV heads if group ratio >1
+-        if self.num_kv_heads != self.num_heads:
+-            factor = self.num_heads // self.num_kv_heads
+-            k = k.repeat_interleave(factor, dim=1)
+-            v = v.repeat_interleave(factor, dim=1)
+-
+         if rope is not None:
+             q, k = self.apply_rope(q, k, rope)
+ 
+         # Scaled dot-product attention
+         attn_out = self.attn_op(
+-            q, k, v, dropout_p=self.attn_drop if self.training else 0.0
++            q, k, v, dropout_p=self.attn_drop if self.training else 0.0,
++            enable_gqa=self.num_kv_heads != self.num_heads,
+         )  # (B, num_heads, N, head_dim)
+ 
+         # Merge heads -> (B, N, embed_dims)
+diff --git a/sapiens/pose/tools/vis/vis_pose.py b/sapiens/pose/tools/vis/vis_pose.py
+index 7775360..f5e8b4b 100644
+--- a/sapiens/pose/tools/vis/vis_pose.py
++++ b/sapiens/pose/tools/vis/vis_pose.py
+@@ -7,6 +7,8 @@
+ import json
+ import os
+ from argparse import ArgumentParser
++from collections import deque
++from concurrent.futures import ThreadPoolExecutor
+ 
+ import cv2
+ import numpy as np
+@@ -71,7 +73,7 @@ def process_one_image(args, image, model):
+         data_samples_list.append(data["data_samples"])
+ 
+     inputs = torch.cat(inputs_list, dim=0)  # B x 3 x H x W
+-    with torch.no_grad():
++    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+         pred = model(inputs)  # B x 3 x H x W
+         if model.cfg.val_cfg is not None and model.cfg.val_cfg.get("flip_test", False):
+             pred_flipped = model(inputs.flip(-1))  # B x 3 x H x W
+@@ -82,7 +84,7 @@ def process_one_image(args, image, model):
+             pred = (pred + pred_flipped) / 2.0
+ 
+     # ------------------------------------------
+-    pred = pred.cpu().numpy()  ## B x K x heatmap_H x heatmap_W
++    pred = pred.float().cpu().numpy()  ## B x K x heatmap_H x heatmap_W
+     keypoints = []
+     keypoint_scores = []
+     for i, data_samples in enumerate(data_samples_list):
+@@ -141,6 +143,14 @@ def main():
+     args = parser.parse_args()
+ 
+     model = init_model(args.config, args.checkpoint, device=args.device)
++    for m in model.modules():
++        if isinstance(m, (torch.nn.Linear, torch.nn.Conv2d,
++                          torch.nn.ConvTranspose2d)):
++            m.to(torch.float16)
++    assert model.backbone.blocks[0].attn.proj.weight.dtype == torch.float16
++    model.forward = torch.compile(
++        model.forward, options={"emulate_precision_casts": True}
++    )
+     os.makedirs(args.output, exist_ok=True)
+ 
+     ## add pose metainfo to model
+@@ -176,9 +186,40 @@ def main():
+     image_size = None
+     num_keypoints_seen = None
+ 
++    def render_and_save(image, keypoints, keypoint_scores, save_path):
++        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
++        vis_image_rgb = visualize_keypoints(
++            image=image_rgb,
++            keypoints=keypoints,
++            keypoints_visible=np.ones_like(keypoint_scores) > 0,
++            keypoint_scores=keypoint_scores,
++            radius=args.radius,
++            thickness=args.thickness,
++            kpt_thr=args.kpt_thr,
++            skeleton=model.pose_metainfo["skeleton_links"],
++            kpt_color=model.pose_metainfo["keypoint_colors"],
++            link_color=model.pose_metainfo["skeleton_link_colors"],
++        )
++        vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
++        cv2.imwrite(save_path, vis_image)
++
++    reader = ThreadPoolExecutor(max_workers=1)
++    writer = ThreadPoolExecutor(max_workers=1)
++    opt_2 = deque()
++    writes = deque()
++    next_read = 0
++
++    def opt_1():
++        nonlocal next_read
++        while len(opt_2) < 4 and next_read < len(image_names):
++            path = os.path.join(input_dir, image_names[next_read])
++            opt_2.append(reader.submit(cv2.imread, path))
++            next_read += 1
++
++    opt_1()
+     for image_name in tqdm(image_names, total=len(image_names)):
+-        image_path = os.path.join(input_dir, image_name)
+-        image = cv2.imread(image_path)
++        image = opt_2.popleft().result()
++        opt_1()
+ 
+         try:
+             keypoints, keypoint_scores, bboxes = process_one_image(
+@@ -193,22 +234,14 @@ def main():
+         if num_keypoints_seen is None and len(keypoints) > 0:
+             num_keypoints_seen = int(np.asarray(keypoints[0]).shape[0])
+ 
+-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+-        vis_image_rgb = visualize_keypoints(
+-            image=image_rgb,
+-            keypoints=keypoints,
+-            keypoints_visible=np.ones_like(keypoint_scores) > 0,
+-            keypoint_scores=keypoint_scores,
+-            radius=args.radius,
+-            thickness=args.thickness,
+-            kpt_thr=args.kpt_thr,
+-            skeleton=model.pose_metainfo["skeleton_links"],
+-            kpt_color=model.pose_metainfo["keypoint_colors"],
+-            link_color=model.pose_metainfo["skeleton_link_colors"],
+-        )
+-        vis_image = cv2.cvtColor(vis_image_rgb, cv2.COLOR_RGB2BGR)
+         save_path = os.path.join(args.output, image_name)
+-        cv2.imwrite(save_path, vis_image)
++        writes.append(
++            writer.submit(
++                render_and_save, image, keypoints, keypoint_scores, save_path
++            )
++        )
++        while len(writes) > 4:
++            writes.popleft().result()
+ 
+         if not args.no_save_json:
+             try:
+@@ -226,6 +259,11 @@ def main():
+             except Exception as e:
+                 print(f"[vis_pose] json record failed on {image_name}: {e}")
+ 
++    for f in writes:
++        f.result()
++    reader.shutdown()
++    writer.shutdown()
++
+     if not args.no_save_json:
+         nn = os.path.basename(os.path.normpath(args.output))
+         # strip a trailing "_output" suffix so the JSON sidecar name matches the

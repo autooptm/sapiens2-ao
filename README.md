@@ -1,3 +1,65 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>Sapiens2 · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>3.37x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-3.37x-2ea44f"></a>
+    <a href="https://github.com/facebookresearch/sapiens2/commit/7e5bae88456ac418ff0e58e74106c9fe192055d4"><img alt="base" src="https://img.shields.io/badge/upstream-7e5bae88456a-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-H100-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [facebookresearch/sapiens2](https://github.com/facebookresearch/sapiens2) at commit
+> [`7e5bae88456a`](https://github.com/facebookresearch/sapiens2/commit/7e5bae88456ac418ff0e58e74106c9fe192055d4) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `cd sapiens/pose && python tools/vis/vis_pose.py <detr-resnet-101-dc5> configs/keypoints308/shutterstock_goliath_3po/sapiens2_1b_keypoints308_shutterstock_goliath_3po-1024x768.py <sapiens2_1b_pose.safetensors> --input <image list> --output <out> --radius 6 --kpt-thr 0.3 --thickness 8` (the command `sapiens/pose/scripts/demo/keypoints308.sh` builds) |
+| **Entry point** | `sapiens/pose/tools/vis/vis_pose.py` |
+| **Unit measured** | one of the repository's 100 demo frames (`demo/data`): read → person detection (DETR) → Sapiens2-1B 308-keypoint pose on each person crop, with the config's flip test → skeleton overlay rendered and written to disk |
+| **Before (stock)** | 901 ms per frame (steady state, median over all 100 frames) |
+| **After (this tree)** | 267 ms per frame (steady state, median over all 100 frames; one-time start-up, 123 s on a cold start, is not included) |
+| **Speedup** | **3.37x** end to end on H100, noise floor of the host 0.29% |
+| **Output** | the pose heatmaps stay within 0.045 (max abs) of the stock fp32 model's, PSNR 85.0 dB against them; within 0.033 on a held-out frame the optimiser never saw; all 100 frames are written |
+
+### What changed
+
+| File | Where | Gain |
+|---|---|---|
+| `sapiens/backbones/sapiens2.py` | GroupedQueryAttention.apply_rope() | — |
+| `sapiens/backbones/sapiens2.py` | GroupedQueryAttention.forward() | — |
+| `sapiens/pose/tools/vis/vis_pose.py` | process_one_image() | — |
+| `sapiens/pose/tools/vis/vis_pose.py` | main() -- model setup | — |
+| `sapiens/pose/tools/vis/vis_pose.py` | main() -- per-frame read / render / write loop | — |
+
+Gains per change were not recorded separately for this run; the 3.37x above is the whole patch, measured end to end.
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/sapiens2-ao.git
+cd sapiens2-ao
+# set up exactly as upstream documents in docs/POSE.md (the DETR detector and the
+# Sapiens2-1B pose checkpoint), then run the demo script, which builds the command above:
+cd sapiens/pose && bash scripts/demo/keypoints308.sh
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff 7e5bae88456a` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
 <p align="center">
   <img src="./docs/assets/sapiens2.gif" alt="Sapiens2" title="Sapiens2" width="500"/>
 </p>

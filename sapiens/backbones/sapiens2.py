@@ -325,12 +325,12 @@ class GroupedQueryAttention(nn.Module):
         N = q.shape[-2]
         prefix = N - sin.shape[-2]  ## extra tokens
         assert prefix >= 0
-        q_prefix = q[:, :, :prefix, :]
-        q = self._rope_apply(q[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
-        q = torch.cat((q_prefix, q), dim=-2)  # [B, head, N, D//head]
-        k_prefix = k[:, :, :prefix, :]
-        k = self._rope_apply(k[:, :, prefix:, :], sin, cos)  # [B, head, hw, D//head]
-        k = torch.cat((k_prefix, k), dim=-2)  # [B, head, N, D//head]
+        if prefix > 0:
+            pad = (prefix, sin.shape[-1])
+            sin = torch.cat((sin.new_zeros(pad), sin), dim=-2)
+            cos = torch.cat((cos.new_ones(pad), cos), dim=-2)
+        q = self._rope_apply(q, sin, cos)  # [B, head, N, D//head]
+        k = self._rope_apply(k, sin, cos)  # [B, head, N, D//head]
         q = q.to(dtype=q_dtype)
         k = k.to(dtype=k_dtype)
         return q, k
@@ -364,18 +364,13 @@ class GroupedQueryAttention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-        # Repeat KV heads if group ratio >1
-        if self.num_kv_heads != self.num_heads:
-            factor = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(factor, dim=1)
-            v = v.repeat_interleave(factor, dim=1)
-
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
 
         # Scaled dot-product attention
         attn_out = self.attn_op(
-            q, k, v, dropout_p=self.attn_drop if self.training else 0.0
+            q, k, v, dropout_p=self.attn_drop if self.training else 0.0,
+            enable_gqa=self.num_kv_heads != self.num_heads,
         )  # (B, num_heads, N, head_dim)
 
         # Merge heads -> (B, N, embed_dims)
